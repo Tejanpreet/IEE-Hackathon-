@@ -5,3 +5,4 @@ python-dotenv>=1.0
 httpx>=0.27  # for the smoke test (FastAPI TestClient)
 pandas>=2.0  # teammate risk engine
 pyproj>=3.6  # teammate risk engine (likelihood.py)
+duckdb  # cluster-mode adapter (reads the Cluster-Ranking service's MotherDuck snapshot)

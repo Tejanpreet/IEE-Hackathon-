@@ -4,6 +4,7 @@ import os
 from dotenv import load_dotenv
 
 load_dotenv()  # must run before the adapter reads RISK_ENGINE_PATH
+load_dotenv("env")  # also pick up a file literally named "env" (no leading dot)
 
 from fastapi import FastAPI, HTTPException, Query  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
