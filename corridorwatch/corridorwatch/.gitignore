@@ -1,0 +1,22 @@
+# secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# deps & builds
+node_modules/
+dist/
+.venv/
+__pycache__/
+*.pyc
+
+# editor / OS
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Claude Code personal settings (team settings in .claude/settings.json are committed)
+.claude/settings.local.json
+*.tsbuildinfo

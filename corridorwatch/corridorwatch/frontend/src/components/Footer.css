@@ -1,0 +1,12 @@
+.footer { background: var(--bg-surface); border-top: 1px solid var(--border-default); padding: var(--space-12) 0 var(--space-8); }
+.footer__top { display: flex; justify-content: space-between; gap: var(--space-12); flex-wrap: wrap; }
+.footer__brand { display: flex; flex-direction: column; gap: var(--space-3); max-width: 320px; }
+.footer__cols { display: flex; gap: 80px; flex-wrap: wrap; }
+.footer__col { display: flex; flex-direction: column; gap: var(--space-3); font-size: 14px; }
+.footer__col h3 { font-weight: 600; }
+.footer__col a { color: var(--text-secondary); }
+.footer__col a:hover { color: var(--text-primary); }
+.footer__bottom {
+  display: flex; justify-content: space-between; gap: var(--space-4); flex-wrap: wrap;
+  margin-top: var(--space-12); padding-top: var(--space-6); border-top: 1px solid var(--border-default);
+}

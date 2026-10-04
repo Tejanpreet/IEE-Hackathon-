@@ -1,0 +1,3 @@
+[submodule "corridorwatch/corridorwatch/vendor/risk-engine"]
+	path = corridorwatch/corridorwatch/vendor/risk-engine
+	url = https://github.com/wmakino/pipeline-incident-risk.git
