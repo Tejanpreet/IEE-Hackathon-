@@ -7,7 +7,10 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': { target: 'http://localhost:8000', changeOrigin: true },
+      // TEMP for local testing: corridorwatch backend moved to 8001 because
+      // the AI microservice (service/) was already running on 8000. Needs a
+      // real decision (stop one, or permanently repoint) - see chat.
+      '/api': { target: 'http://localhost:8001', changeOrigin: true },
     },
   },
 });

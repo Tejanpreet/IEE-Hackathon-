@@ -15,19 +15,36 @@ Shapes (plain dicts, validated later by app/schemas.py):
 from __future__ import annotations
 
 import importlib
+import json
 import math
 import os
 import re
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 
+import duckdb
+import httpx
+
 from app.data import mock
 
 ENGINE_PATH = os.getenv("RISK_ENGINE_PATH", "").strip()
-LIVE = bool(ENGINE_PATH)
+MOTHERDUCK_TOKEN = os.getenv("MOTHERDUCK_TOKEN", "").strip()
+# The deployed Cluster-Ranking service (Render). Ranking/detail data comes
+# from here over real HTTP, not a MotherDuck read - this is what actually
+# exercises the live service rather than just its snapshot table.
+CLUSTER_SERVICE_URL = os.getenv(
+    "CLUSTER_SERVICE_URL", "https://cw-cluster-ranking-service.onrender.com"
+).strip().rstrip("/")
+# Cluster mode takes priority over the submodule import: it's the decoupled
+# replacement for corridor+count-weight ranking (docs/05-decoupling-plan.md
+# Phase 3). Still needs MotherDuck directly for per-incident display fields
+# (date/type/volume/product) the Cluster-Ranking service's API doesn't carry.
+CLUSTER_MODE = bool(MOTHERDUCK_TOKEN)
+LIVE = CLUSTER_MODE or bool(ENGINE_PATH)
 
 CSV_NAME = "data/pipeline-incidents-comprehensive-data.csv"
 PROVINCE = "Alberta"
@@ -165,6 +182,157 @@ def _hull(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
     return lower[:-1] + upper[:-1]
 
 
+# ---------- Cluster-snapshot data (MotherDuck, via cluster-ranking-service) ----------
+# Reads cluster_rankings directly rather than calling the Cluster-Ranking
+# service's HTTP API - same database, same credential, no extra moving part
+# for the demo, and symmetric with how that service itself only ever reads
+# MotherDuck. "corridor" fields below are a compatibility shape for this
+# contract (docs/API_CONTRACT.md); the underlying grouping is a cluster.
+
+_ID_HASH_SUFFIX = re.compile(r"-[0-9a-f]{8}$")
+
+
+def _cluster_con() -> duckdb.DuckDBPyConnection:
+    return duckdb.connect("md:pipeline_incident_ai", config={"motherduck_token": MOTHERDUCK_TOKEN})
+
+
+def _humanize_cluster_id(cid: str) -> str:
+    base = _ID_HASH_SUFFIX.sub("", cid)
+    words = [w.upper() if len(w) <= 2 else w.capitalize() for w in base.split("-")]
+    return " ".join(words) or cid
+
+
+def _parse_mdy_iso(value: str | None) -> str:
+    if not value:
+        return ""
+    month, day, year = (int(p) for p in value.split("/"))
+    return datetime(year, month, day).date().isoformat()
+
+
+def _parse_float(value: str | None) -> float | None:
+    text = (value or "").strip()
+    try:
+        return float(text) if text else None
+    except ValueError:
+        return None
+
+
+@lru_cache(maxsize=1)
+def _incident_index() -> dict[str, dict]:
+    """incident_number -> the per-incident fields the contract needs that
+    aren't already on the cluster snapshot row (date/type/volume/lat/lng/
+    inspected/substance for product detection)."""
+    con = _cluster_con()
+    cur = con.execute(
+        "SELECT r.incident_number, r.latitude, r.longitude, r.reported_date, r.incident_types, "
+        "r.approximate_volume_released_m3, r.equipment_or_component_has_never_been_inspected, "
+        "r.substance, r.substance_carried, s.likelihood "
+        "FROM raw_incidents r LEFT JOIN incident_scores s ON r.incident_number = s.incident_number"
+    )
+    cols = [d[0] for d in cur.description]
+    by_id = {}
+    for row in cur.fetchall():
+        r = dict(zip(cols, row))
+        by_id[r["incident_number"]] = {
+            "lat": _parse_float(r["latitude"]),
+            "lng": _parse_float(r["longitude"]),
+            "date": _parse_mdy_iso(r["reported_date"]),
+            "type": (r["incident_types"] or "").split(",")[0].strip() or "Unspecified",
+            "volume_m3": _parse_float(r["approximate_volume_released_m3"]),
+            "inspected": r["equipment_or_component_has_never_been_inspected"] != "Yes",
+            "level": r["likelihood"] or 1,
+            "product": _product(r["substance_carried"] or "") or _product(r["substance"] or ""),
+        }
+    return by_id
+
+
+@lru_cache(maxsize=1)
+def _live_ranking_response() -> dict:
+    """The one genuinely-over-the-network call in this adapter: the deployed
+    Cluster-Ranking service's own ranked list + totals, fetched over real
+    HTTP. This is what actually exercises the live Render service, not just
+    its underlying MotherDuck snapshot table."""
+    resp = httpx.get(f"{CLUSTER_SERVICE_URL}/api/v2/ranking", params={"limit": 200}, timeout=30.0)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@lru_cache(maxsize=1)
+def _cluster_members_by_id() -> dict[str, list[str]]:
+    """Product-mix needs every cluster's membership. Hitting the live detail
+    endpoint once per cluster (200+ requests against a free-tier instance)
+    would be far too slow, so only this lookup still reads the snapshot
+    table directly - rank/score/centroid/consequence all come from the live
+    call above."""
+    con = _cluster_con()
+    cur = con.execute("SELECT id, members FROM cluster_rankings")
+    return {row[0]: json.loads(row[1]) for row in cur.fetchall()}
+
+
+@lru_cache(maxsize=1)
+def _cluster_rows() -> list[dict]:
+    idx = _incident_index()
+    members_by_id = _cluster_members_by_id()
+    rows = []
+    for c in _live_ranking_response()["rows"]:
+        members = members_by_id.get(c["id"], [])
+        products = Counter(idx[m]["product"] for m in members if m in idx and idx[m]["product"])
+        rows.append({
+            "id": c["id"],
+            "corridor": _humanize_cluster_id(c["id"]),
+            "product": products.most_common(1)[0][0] if products else "sweet_gas",
+            "incidents": c["incident_count"],
+            "consequence": _bucket(c["max_consequence"]),
+            "centroid": {"lat": c["centroid"]["lat"], "lng": c["centroid"]["lng"]},
+        })
+    return rows
+
+
+@lru_cache(maxsize=1)
+def _cluster_meta() -> dict:
+    data = _live_ranking_response()
+    generated = data["generated_at"]
+    return {
+        "total_incidents": data["total_incidents"],
+        "dropped_undated": 0,
+        "total_corridors": data["total_clusters"],
+        "generated_at": generated if generated.endswith("Z") else generated + "Z",
+    }
+
+
+def _cluster_members(cid: str) -> list[str]:
+    """Live call, on demand - one cluster's detail, exactly when the
+    frontend asks for it (drawer open), not for the whole list."""
+    resp = httpx.get(f"{CLUSTER_SERVICE_URL}/api/v2/cluster/{cid}", timeout=30.0)
+    if resp.status_code == 404:
+        return []
+    resp.raise_for_status()
+    return resp.json()["members"]
+
+
+def _cluster_incidents(cid: str) -> list[dict]:
+    idx = _incident_index()
+    out = []
+    for member in _cluster_members(cid):
+        info = idx.get(member)
+        if not info or info["lat"] is None:
+            continue
+        out.append({
+            "id": member, "lat": info["lat"], "lng": info["lng"], "level": info["level"],
+            "date": info["date"], "type": info["type"], "volume_m3": info["volume_m3"],
+            "inspected": info["inspected"],
+        })
+    return out
+
+
+def _cluster_boundary(cid: str) -> list[dict]:
+    row = next((r for r in _cluster_rows() if r["id"] == cid), None)
+    if not row:
+        return []
+    incs = _cluster_incidents(cid)
+    return _padded_boundary(row["centroid"]["lat"], row["centroid"]["lng"], incs)
+
+
 # ---------- Live data from the teammate's engine (vendor/risk-engine) ----------
 
 def _live_corridors() -> list[dict]:
@@ -185,13 +353,9 @@ def _live_incidents(cid: str) -> list[dict]:
     return _load()["incidents"].get(cid, [])
 
 
-def _live_boundary(cid: str) -> list[dict]:
-    """Padded hull of the corridor's incidents. Placeholder until the 'real corridor boundaries' task."""
-    c = next((c for c in _live_corridors() if c["id"] == cid), None)
-    if not c:
-        return []
-    lat, lng = c["centroid"]["lat"], c["centroid"]["lng"]
-    hull = _hull([(i["lng"], i["lat"]) for i in _live_incidents(cid)])
+def _padded_boundary(lat: float, lng: float, incs: list[dict]) -> list[dict]:
+    """Padded hull around a centroid + its incidents. Placeholder until the 'real boundaries' task."""
+    hull = _hull([(i["lng"], i["lat"]) for i in incs])
     if len(hull) < 3:
         return [
             {"lat": lat + math.sin(a) * 0.08, "lng": lng + math.cos(a) * 0.13}
@@ -206,6 +370,13 @@ def _live_boundary(cid: str) -> list[dict]:
     return out
 
 
+def _live_boundary(cid: str) -> list[dict]:
+    c = next((c for c in _live_corridors() if c["id"] == cid), None)
+    if not c:
+        return []
+    return _padded_boundary(c["centroid"]["lat"], c["centroid"]["lng"], _live_incidents(cid))
+
+
 def _live_pipelines(cid: str) -> list[dict]:
     # Empty until the "Real pipeline geometry (CER pipeline systems layer)" roadmap task.
     return []
@@ -214,22 +385,32 @@ def _live_pipelines(cid: str) -> list[dict]:
 # ---------- Public API used by routes (don't change signatures) ----------
 
 def corridors() -> list[dict]:
+    if CLUSTER_MODE:
+        return [{k: v for k, v in r.items() if not k.startswith("_")} for r in _cluster_rows()]
     return _live_corridors() if LIVE else mock.corridors()
 
 
 def totals() -> dict:
+    if CLUSTER_MODE:
+        return _cluster_meta()
     return _live_totals() if LIVE else mock.TOTALS
 
 
 def incidents(cid: str) -> list[dict]:
+    if CLUSTER_MODE:
+        return _cluster_incidents(cid)
     return _live_incidents(cid) if LIVE else mock.incidents(cid)
 
 
 def boundary(cid: str) -> list[dict]:
+    if CLUSTER_MODE:
+        return _cluster_boundary(cid)
     return _live_boundary(cid) if LIVE else mock.boundary(cid)
 
 
 def pipelines(cid: str) -> list[dict]:
+    # Empty in cluster mode too - real pipeline geometry was already a TODO
+    # placeholder before this change (see _live_pipelines).
     return _live_pipelines(cid) if LIVE else mock.pipelines(cid)
 
 
