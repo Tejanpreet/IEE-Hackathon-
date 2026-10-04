@@ -23,6 +23,16 @@ python -m app.smoke                                  # checks every endpoint
 ```
 Then set `VITE_USE_MOCKS=false` in `frontend/.env.local` and restart `npm run dev`.
 
+## Setup (includes the teammate risk engine submodule)
+
+git clone --recurse-submodules <your-repo-url>
+
+Already cloned without the flag? Run:
+git submodule update --init
+
+Backend: copy backend/.env.example to backend/.env and set
+RISK_ENGINE_PATH=../vendor/risk-engine
+
 ## Working with Claude Code
 Open this folder in VS Code and run `claude` in the terminal (or use the extension).
 It reads `CLAUDE.md` automatically, which points it at the roadmap, design spec and API contract.
